@@ -94,3 +94,85 @@
     total-payouts: (var-get total-payouts),
     oracle: (var-get oracle-address)
   }))
+
+
+(define-constant BASIC-TIER-PREMIUM u500000)
+(define-constant BASIC-TIER-PAYOUT u1500000)
+(define-constant PREMIUM-TIER-PREMIUM u2000000) 
+(define-constant PREMIUM-TIER-PAYOUT u6000000)
+
+(define-map insurance-tiers
+  uint
+  {
+    premium: uint,
+    payout: uint,
+    name: (string-ascii 10)
+  }
+)
+
+(define-public (initialize-tiers)
+  (begin
+    (map-set insurance-tiers u1 
+      {
+        premium: BASIC-TIER-PREMIUM,
+        payout: BASIC-TIER-PAYOUT,
+        name: "BASIC"
+      })
+    (map-set insurance-tiers u2
+      {
+        premium: PREMIUM-TIER-PREMIUM,
+        payout: PREMIUM-TIER-PAYOUT,
+        name: "PREMIUM"
+      })
+    (ok true)))
+
+(define-public (purchase-tiered-insurance (region (string-ascii 32)) (tier-id uint))
+  (let (
+    (tier (unwrap! (map-get? insurance-tiers tier-id) ERR-INVALID-AMOUNT))
+    (farmer-data (default-to 
+      { active: false, premium-paid: u0, last-payout: u0, region: region }
+      (map-get? insured-farmers tx-sender))))
+    (asserts! (not (get active farmer-data)) ERR-ALREADY-INSURED)
+    (try! (stx-transfer? (get premium tier) tx-sender (as-contract tx-sender)))
+    (var-set total-premiums (+ (var-get total-premiums) (get premium tier)))
+    (ok (map-set insured-farmers tx-sender
+      {
+        active: true,
+        premium-paid: (get premium tier),
+        last-payout: u0,
+        region: region
+      }))))
+
+
+(define-map risk-factors
+  (string-ascii 32)
+  {
+    risk-score: uint,
+    last-updated: uint,
+    consecutive-droughts: uint
+  }
+)
+
+(define-constant RISK-MULTIPLIER u100)
+(define-constant BASE-RISK-SCORE u1000)
+
+(define-public (update-risk-factors (region (string-ascii 32)))
+  (let (
+    (current-weather (unwrap! (map-get? weather-data region) ERR-INVALID-WEATHER-DATA))
+    (current-risk (default-to 
+      { risk-score: BASE-RISK-SCORE, last-updated: u0, consecutive-droughts: u0 }
+      (map-get? risk-factors region)))
+    (new-drought-count (if (< (get rainfall current-weather) MINIMUM-RAINFALL)
+      (+ (get consecutive-droughts current-risk) u1)
+      u0)))
+    (ok (map-set risk-factors region
+      {
+        risk-score: (+ BASE-RISK-SCORE (* new-drought-count RISK-MULTIPLIER)),
+        last-updated: stacks-block-height,
+        consecutive-droughts: new-drought-count
+      }))))
+
+(define-read-only (get-risk-adjusted-payout (region (string-ascii 32)))
+  (let (
+    (risk-data (unwrap! (map-get? risk-factors region) ERR-INVALID-WEATHER-DATA)))
+    (ok (* PAYOUT-AMOUNT (/ (get risk-score risk-data) BASE-RISK-SCORE)))))
