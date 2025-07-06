@@ -351,3 +351,130 @@
 
 (define-read-only (calculate-premium-quote (perils (list 10 uint)))
   (ok (fold calculate-peril-premium perils u0)))
+
+
+  (define-constant ERR-INSUFFICIENT-STAKE (err u108))
+(define-constant ERR-STAKE-NOT-FOUND (err u109))
+(define-constant ERR-POOL-INSUFFICIENT-FUNDS (err u110))
+(define-constant ERR-COOLDOWN-PERIOD (err u111))
+
+(define-constant MINIMUM-STAKE-AMOUNT u1000000)
+(define-constant STAKE-COOLDOWN-PERIOD u1008)
+(define-constant YIELD-RATE u5)
+(define-constant YIELD-PERIOD u144)
+
+(define-data-var total-pool-balance uint u0)
+(define-data-var total-staked-amount uint u0)
+(define-data-var last-yield-distribution uint u0)
+
+(define-map stake-positions
+  principal
+  {
+    amount: uint,
+    entry-block: uint,
+    last-yield-claim: uint,
+    accumulated-yield: uint
+  }
+)
+
+(define-map stake-withdrawal-requests
+  principal
+  {
+    amount: uint,
+    request-block: uint,
+    processed: bool
+  }
+)
+
+(define-public (stake-in-pool (amount uint))
+  (let (
+    (current-position (default-to 
+      { amount: u0, entry-block: u0, last-yield-claim: u0, accumulated-yield: u0 }
+      (map-get? stake-positions tx-sender))))
+    (asserts! (>= amount MINIMUM-STAKE-AMOUNT) ERR-INSUFFICIENT-STAKE)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set total-pool-balance (+ (var-get total-pool-balance) amount))
+    (var-set total-staked-amount (+ (var-get total-staked-amount) amount))
+    (ok (map-set stake-positions tx-sender
+      {
+        amount: (+ (get amount current-position) amount),
+        entry-block: stacks-block-height,
+        last-yield-claim: stacks-block-height,
+        accumulated-yield: (get accumulated-yield current-position)
+      }))))
+
+(define-public (request-stake-withdrawal (amount uint))
+  (let (
+    (position (unwrap! (map-get? stake-positions tx-sender) ERR-STAKE-NOT-FOUND)))
+    (asserts! (<= amount (get amount position)) ERR-INSUFFICIENT-STAKE)
+    (ok (map-set stake-withdrawal-requests tx-sender
+      {
+        amount: amount,
+        request-block: stacks-block-height,
+        processed: false
+      }))))
+
+(define-public (process-stake-withdrawal)
+  (let (
+    (withdrawal-req (unwrap! (map-get? stake-withdrawal-requests tx-sender) ERR-STAKE-NOT-FOUND))
+    (position (unwrap! (map-get? stake-positions tx-sender) ERR-STAKE-NOT-FOUND))
+    (cooldown-passed (> stacks-block-height (+ (get request-block withdrawal-req) STAKE-COOLDOWN-PERIOD))))
+    (asserts! cooldown-passed ERR-COOLDOWN-PERIOD)
+    (asserts! (not (get processed withdrawal-req)) ERR-STAKE-NOT-FOUND)
+    (asserts! (>= (var-get total-pool-balance) (get amount withdrawal-req)) ERR-POOL-INSUFFICIENT-FUNDS)
+    (try! (as-contract (stx-transfer? (get amount withdrawal-req) (as-contract tx-sender) tx-sender)))
+    (var-set total-pool-balance (- (var-get total-pool-balance) (get amount withdrawal-req)))
+    (var-set total-staked-amount (- (var-get total-staked-amount) (get amount withdrawal-req)))
+    (map-set stake-positions tx-sender
+      (merge position { amount: (- (get amount position) (get amount withdrawal-req)) }))
+    (ok (map-set stake-withdrawal-requests tx-sender
+      (merge withdrawal-req { processed: true })))))
+
+(define-public (claim-staking-yield)
+  (let (
+    (position (unwrap! (map-get? stake-positions tx-sender) ERR-STAKE-NOT-FOUND))
+    (blocks-since-last-claim (- stacks-block-height (get last-yield-claim position)))
+    (yield-periods (/ blocks-since-last-claim YIELD-PERIOD))
+    (yield-amount (/ (* (get amount position) YIELD-RATE yield-periods) u1000)))
+    (asserts! (> yield-amount u0) ERR-INSUFFICIENT-STAKE)
+    (asserts! (>= (var-get total-pool-balance) yield-amount) ERR-POOL-INSUFFICIENT-FUNDS)
+    (try! (as-contract (stx-transfer? yield-amount (as-contract tx-sender) tx-sender)))
+    (var-set total-pool-balance (- (var-get total-pool-balance) yield-amount))
+    (ok (map-set stake-positions tx-sender
+      (merge position { 
+        last-yield-claim: stacks-block-height,
+        accumulated-yield: (+ (get accumulated-yield position) yield-amount)
+      })))))
+
+(define-public (distribute-pool-yield)
+  (let (
+    (blocks-since-last-distribution (- stacks-block-height (var-get last-yield-distribution)))
+    (premium-income (var-get total-premiums))
+    (total-staked (var-get total-staked-amount)))
+    (asserts! (> blocks-since-last-distribution YIELD-PERIOD) ERR-COOLDOWN-PERIOD)
+    (asserts! (> total-staked u0) ERR-INSUFFICIENT-STAKE)
+    (var-set last-yield-distribution stacks-block-height)
+    (ok true)))
+
+(define-read-only (get-stake-position (staker principal))
+  (ok (map-get? stake-positions staker)))
+
+(define-read-only (get-withdrawal-request (staker principal))
+  (ok (map-get? stake-withdrawal-requests staker)))
+
+(define-read-only (get-pool-statistics)
+  (ok {
+    total-pool-balance: (var-get total-pool-balance),
+    total-staked-amount: (var-get total-staked-amount),
+    last-yield-distribution: (var-get last-yield-distribution),
+    current-yield-rate: YIELD-RATE
+  }))
+
+(define-read-only (calculate-pending-yield (staker principal))
+  (match (map-get? stake-positions staker)
+    position (let (
+      (blocks-since-last-claim (- stacks-block-height (get last-yield-claim position)))
+      (yield-periods (/ blocks-since-last-claim YIELD-PERIOD))
+      (pending-yield (/ (* (get amount position) YIELD-RATE yield-periods) u1000)))
+      (ok pending-yield))
+    (ok u0)))
