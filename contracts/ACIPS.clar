@@ -478,3 +478,237 @@
       (pending-yield (/ (* (get amount position) YIELD-RATE yield-periods) u1000)))
       (ok pending-yield))
     (ok u0)))
+
+;; Automated Weather-Triggered Claim Processing Engine
+(define-constant ERR-AUTO-PROCESSING-DISABLED (err u112))
+(define-constant ERR-REGION-NOT-AFFECTED (err u113))
+(define-constant ERR-BATCH-SIZE-EXCEEDED (err u114))
+(define-constant ERR-PROCESSING-ALREADY-TRIGGERED (err u115))
+(define-constant ERR-EMERGENCY-OVERRIDE-REQUIRED (err u116))
+
+(define-constant MAX-BATCH-SIZE u50)
+(define-constant AUTO-PROCESSING-DELAY u6)
+(define-constant CATASTROPHIC-MULTIPLIER u200)
+(define-constant EMERGENCY-THRESHOLD-MULTIPLIER u150)
+
+(define-data-var auto-processing-enabled bool true)
+(define-data-var emergency-processing-active bool false)
+(define-data-var total-auto-processed-claims uint u0)
+(define-data-var last-auto-processing-block uint u0)
+
+;; Track regional weather emergencies and processing status
+(define-map regional-weather-emergency
+  (string-ascii 32)
+  {
+    active: bool,
+    severity-level: uint,
+    triggered-block: uint,
+    affected-farmers-count: uint,
+    processing-completed: bool
+  }
+)
+
+;; Track batch processing progress for large-scale events
+(define-map batch-processing-status
+  { region: (string-ascii 32), batch-id: uint }
+  {
+    farmers-processed: uint,
+    total-farmers: uint,
+    total-payouts: uint,
+    processing-block: uint,
+    completed: bool
+  }
+)
+
+;; Store farmers queued for automatic processing
+(define-map auto-claim-queue
+  { region: (string-ascii 32), farmer: principal }
+  {
+    peril-types: (list 10 uint),
+    priority-level: uint,
+    queued-block: uint,
+    processed: bool
+  }
+)
+
+;; Emergency override records for audit trail
+(define-map emergency-overrides
+  { region: (string-ascii 32), override-block: uint }
+  {
+    triggered-by: principal,
+    reason: (string-ascii 50),
+    farmers-affected: uint,
+    total-emergency-payout: uint
+  }
+)
+
+;; Monitor weather conditions and trigger automatic processing
+(define-public (trigger-automatic-claim-processing (region (string-ascii 32)))
+  (let (
+    (weather (unwrap! (map-get? weather-data region) ERR-INVALID-WEATHER-DATA))
+    (current-emergency (default-to 
+      { active: false, severity-level: u0, triggered-block: u0, affected-farmers-count: u0, processing-completed: false }
+      (map-get? regional-weather-emergency region)))
+    (severity-score (calculate-weather-severity weather))
+    (blocks-since-last-processing (- stacks-block-height (var-get last-auto-processing-block))))
+    (asserts! (var-get auto-processing-enabled) ERR-AUTO-PROCESSING-DISABLED)
+    (asserts! (> blocks-since-last-processing AUTO-PROCESSING-DELAY) ERR-PROCESSING-ALREADY-TRIGGERED)
+    (asserts! (not (get active current-emergency)) ERR-PROCESSING-ALREADY-TRIGGERED)
+    (asserts! (> severity-score u100) ERR-REGION-NOT-AFFECTED)
+    (var-set last-auto-processing-block stacks-block-height)
+    (ok (map-set regional-weather-emergency region
+      {
+        active: true,
+        severity-level: severity-score,
+        triggered-block: stacks-block-height,
+        affected-farmers-count: u0,
+        processing-completed: false
+      }))))
+
+;; Process claims automatically for all eligible farmers in affected region
+(define-public (process-regional-batch-claims (region (string-ascii 32)) (farmers-list (list 50 principal)) (batch-id uint))
+  (let (
+    (emergency-status (unwrap! (map-get? regional-weather-emergency region) ERR-REGION-NOT-AFFECTED))
+    (weather-conditions (unwrap! (map-get? weather-data region) ERR-INVALID-WEATHER-DATA))
+    (batch-status (default-to 
+      { farmers-processed: u0, total-farmers: u0, total-payouts: u0, processing-block: u0, completed: false }
+      (map-get? batch-processing-status { region: region, batch-id: batch-id })))
+    (farmers-count (len farmers-list)))
+    (asserts! (get active emergency-status) ERR-REGION-NOT-AFFECTED)
+    (asserts! (<= farmers-count MAX-BATCH-SIZE) ERR-BATCH-SIZE-EXCEEDED)
+    (asserts! (not (get completed batch-status)) ERR-PROCESSING-ALREADY-TRIGGERED)
+    (let ((batch-result (process-farmers-batch farmers-list region weather-conditions (get severity-level emergency-status))))
+      (unwrap! batch-result ERR-PAYOUT-FAILED))
+    (map-set batch-processing-status { region: region, batch-id: batch-id }
+      {
+        farmers-processed: farmers-count,
+        total-farmers: farmers-count,
+        total-payouts: (* farmers-count PAYOUT-AMOUNT),
+        processing-block: stacks-block-height,
+        completed: true
+      })
+    (var-set total-auto-processed-claims (+ (var-get total-auto-processed-claims) farmers-count))
+    (ok (map-set regional-weather-emergency region
+      (merge emergency-status { 
+        affected-farmers-count: (+ (get affected-farmers-count emergency-status) farmers-count),
+        processing-completed: true 
+      })))))
+
+;; Emergency override processing for catastrophic events
+(define-public (emergency-override-processing (region (string-ascii 32)) (affected-farmers (list 50 principal)) (reason (string-ascii 50)))
+  (let (
+    (weather-data-exists (is-some (map-get? weather-data region)))
+    (farmers-count (len affected-farmers))
+    (emergency-payout (* farmers-count PAYOUT-AMOUNT CATASTROPHIC-MULTIPLIER))
+    (override-key { region: region, override-block: stacks-block-height }))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! weather-data-exists ERR-INVALID-WEATHER-DATA)
+    (asserts! (> farmers-count u0) ERR-BATCH-SIZE-EXCEEDED)
+    (var-set emergency-processing-active true)
+    (let ((emergency-result (process-emergency-batch affected-farmers emergency-payout)))
+      (unwrap! emergency-result ERR-PAYOUT-FAILED))
+    (map-set emergency-overrides override-key
+      {
+        triggered-by: tx-sender,
+        reason: reason,
+        farmers-affected: farmers-count,
+        total-emergency-payout: emergency-payout
+      })
+    (var-set total-auto-processed-claims (+ (var-get total-auto-processed-claims) farmers-count))
+    (ok (var-set emergency-processing-active false))))
+
+;; Queue farmers for automatic claim processing based on coverage
+(define-public (queue-farmer-for-auto-processing (region (string-ascii 32)) (farmer-address principal) (covered-perils (list 10 uint)))
+  (let (
+    (farmer-info (unwrap! (map-get? insured-farmers farmer-address) ERR-NOT-INSURED))
+    (emergency-active (default-to 
+      { active: false, severity-level: u0, triggered-block: u0, affected-farmers-count: u0, processing-completed: false }
+      (map-get? regional-weather-emergency region)))
+    (priority-level (if (>= (get severity-level emergency-active) EMERGENCY-THRESHOLD-MULTIPLIER) u1 u2)))
+    (asserts! (get active farmer-info) ERR-NOT-INSURED)
+    (asserts! (is-eq (get region farmer-info) region) ERR-REGION-NOT-AFFECTED)
+    (asserts! (get active emergency-active) ERR-REGION-NOT-AFFECTED)
+    (ok (map-set auto-claim-queue { region: region, farmer: farmer-address }
+      {
+        peril-types: covered-perils,
+        priority-level: priority-level,
+        queued-block: stacks-block-height,
+        processed: false
+      }))))
+
+;; Toggle automatic processing system on/off
+(define-public (toggle-auto-processing (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (ok (var-set auto-processing-enabled enabled))))
+
+;; Private helper function to calculate weather severity score
+(define-private (calculate-weather-severity (weather { rainfall: uint, temperature: uint, timestamp: uint }))
+  (let (
+    (drought-severity (if (< (get rainfall weather) MINIMUM-RAINFALL) 
+      (- MINIMUM-RAINFALL (get rainfall weather)) u0))
+    (heat-severity (if (> (get temperature weather) HEAT-THRESHOLD) 
+      (- (get temperature weather) HEAT-THRESHOLD) u0))
+    (frost-severity (if (< (get temperature weather) FROST-THRESHOLD) 
+      (- FROST-THRESHOLD (get temperature weather)) u0)))
+    (+ drought-severity heat-severity frost-severity)))
+
+;; Private helper to process batch of farmers
+(define-private (process-farmers-batch (farmers (list 50 principal)) (region (string-ascii 32)) (weather { rainfall: uint, temperature: uint, timestamp: uint }) (severity uint))
+  (let ((batch-result (fold process-single-farmer farmers { success-count: u0, total-payout: u0 })))
+    (ok batch-result)))
+
+;; Private helper to process individual farmer in batch
+(define-private (process-single-farmer (farmer principal) (acc { success-count: uint, total-payout: uint }))
+  (match (map-get? insured-farmers farmer)
+    farmer-data (if (get active farmer-data)
+      { 
+        success-count: (+ (get success-count acc) u1), 
+        total-payout: (+ (get total-payout acc) PAYOUT-AMOUNT) 
+      }
+      acc)
+    acc))
+
+;; Private helper for emergency batch processing
+(define-private (process-emergency-batch (farmers (list 50 principal)) (total-payout uint))
+  (let ((result (fold emergency-process-farmer farmers { processed: u0, total-paid: u0 })))
+    (ok result)))
+
+;; Private helper for emergency individual processing
+(define-private (emergency-process-farmer (farmer principal) (acc { processed: uint, total-paid: uint }))
+  (match (map-get? insured-farmers farmer)
+    farmer-data { processed: (+ (get processed acc) u1), total-paid: (+ (get total-paid acc) PAYOUT-AMOUNT) }
+    acc))
+
+;; Read-only functions for monitoring and analytics
+(define-read-only (get-regional-emergency-status (region (string-ascii 32)))
+  (ok (map-get? regional-weather-emergency region)))
+
+(define-read-only (get-batch-processing-status (region (string-ascii 32)) (batch-id uint))
+  (ok (map-get? batch-processing-status { region: region, batch-id: batch-id })))
+
+(define-read-only (get-auto-claim-queue-status (region (string-ascii 32)) (farmer principal))
+  (ok (map-get? auto-claim-queue { region: region, farmer: farmer })))
+
+(define-read-only (get-emergency-override-details (region (string-ascii 32)) (override-block uint))
+  (ok (map-get? emergency-overrides { region: region, override-block: override-block })))
+
+(define-read-only (get-auto-processing-statistics)
+  (ok {
+    auto-processing-enabled: (var-get auto-processing-enabled),
+    emergency-processing-active: (var-get emergency-processing-active),
+    total-auto-processed-claims: (var-get total-auto-processed-claims),
+    last-auto-processing-block: (var-get last-auto-processing-block)
+  }))
+
+(define-read-only (check-region-processing-eligibility (region (string-ascii 32)))
+  (match (map-get? weather-data region)
+    weather (let ((severity (calculate-weather-severity weather)))
+      (ok { eligible: (> severity u100), severity-score: severity }))
+    (ok { eligible: false, severity-score: u0 })))
+
+
+
+
+
+
