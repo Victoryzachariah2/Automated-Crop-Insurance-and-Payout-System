@@ -680,6 +680,128 @@
     farmer-data { processed: (+ (get processed acc) u1), total-paid: (+ (get total-paid acc) PAYOUT-AMOUNT) }
     acc))
 
+;; Insurance Policy Transfer Feature
+(define-constant ERR-TRANSFER-NOT-ALLOWED (err u117))
+(define-constant ERR-POLICY-NOT_TRANSFERABLE (err u118))
+(define-constant ERR-INVALID-TRANSFER-FEE (err u119))
+(define-constant ERR-RECIPIENT-ALREADY-INSURED (err u120))
+
+(define-constant TRANSFER-FEE-PERCENTAGE u5) ;; 5% transfer fee
+(define-constant MIN-BLOCKS-BEFORE_TRANSFER u144) ;; ~1 day
+
+;; Track policy transfer offers
+(define-map policy-transfer-offers
+  principal ;; current policy holder
+  {
+    recipient: principal,
+    transfer-fee: uint,
+    offer-block: uint,
+    expires-at: uint,
+    active: bool
+  }
+)
+
+;; Track transfer history for audit
+(define-map policy-transfers
+  { from: principal, to: principal, transfer-block: uint }
+  {
+    original-premium: uint,
+    transfer-fee: uint,
+    region: (string-ascii 32),
+    coverage-type: (string-ascii 20)
+  }
+)
+
+;; Create a policy transfer offer
+(define-public (create-policy-transfer-offer (recipient principal) (transfer-fee uint) (expiry-blocks uint))
+  (let (
+    (farmer-data (unwrap! (map-get? insured-farmers tx-sender) ERR-NOT-INSURED))
+    (blocks-since-purchase (- stacks-block-height (get last-payout farmer-data)))
+    (min-transfer-fee (/ (* (get premium-paid farmer-data) TRANSFER-FEE-PERCENTAGE) u100)))
+    (asserts! (get active farmer-data) ERR-NOT-INSURED)
+    (asserts! (> blocks-since-purchase MIN-BLOCKS-BEFORE_TRANSFER) ERR-TRANSFER-NOT-ALLOWED)
+    (asserts! (>= transfer-fee min-transfer-fee) ERR-INVALID-TRANSFER-FEE)
+    (asserts! (is-none (map-get? insured-farmers recipient)) ERR-RECIPIENT-ALREADY-INSURED)
+    (ok (map-set policy-transfer-offers tx-sender
+      {
+        recipient: recipient,
+        transfer-fee: transfer-fee,
+        offer-block: stacks-block-height,
+        expires-at: (+ stacks-block-height expiry-blocks),
+        active: true
+      }))))
+
+;; Accept a policy transfer offer
+(define-public (accept-policy-transfer (current-holder principal))
+  (let (
+    (transfer-offer (unwrap! (map-get? policy-transfer-offers current-holder) ERR-TRANSFER-NOT-ALLOWED))
+    (holder-data (unwrap! (map-get? insured-farmers current-holder) ERR-NOT-INSURED))
+    (holder-coverage (map-get? farmer-coverage current-holder)))
+    (asserts! (is-eq (get recipient transfer-offer) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (get active transfer-offer) ERR-TRANSFER-NOT-ALLOWED)
+    (asserts! (< stacks-block-height (get expires-at transfer-offer)) ERR-TRANSFER-NOT-ALLOWED)
+    (asserts! (get active holder-data) ERR-NOT-INSURED)
+    (asserts! (is-none (map-get? insured-farmers tx-sender)) ERR-ALREADY-INSURED)
+    
+    ;; Pay transfer fee to current holder
+    (try! (stx-transfer? (get transfer-fee transfer-offer) tx-sender current-holder))
+    
+    ;; Transfer policy to new holder
+    (map-set insured-farmers tx-sender holder-data)
+    (map-delete insured-farmers current-holder)
+    
+    ;; Transfer coverage if exists
+    (match holder-coverage
+      coverage-data (begin
+        (map-set farmer-coverage tx-sender coverage-data)
+        (map-delete farmer-coverage current-holder))
+      true)
+    
+    ;; Record transfer history
+    (map-set policy-transfers { from: current-holder, to: tx-sender, transfer-block: stacks-block-height }
+      {
+        original-premium: (get premium-paid holder-data),
+        transfer-fee: (get transfer-fee transfer-offer),
+        region: (get region holder-data),
+        coverage-type: "STANDARD"
+      })
+    
+    ;; Remove transfer offer
+    (ok (map-delete policy-transfer-offers current-holder))))
+
+;; Cancel a policy transfer offer
+(define-public (cancel-policy-transfer-offer)
+  (let (
+    (transfer-offer (unwrap! (map-get? policy-transfer-offers tx-sender) ERR-TRANSFER-NOT-ALLOWED)))
+    (asserts! (get active transfer-offer) ERR-TRANSFER-NOT-ALLOWED)
+    (ok (map-delete policy-transfer-offers tx-sender))))
+
+;; Calculate minimum transfer fee for a policy
+(define-read-only (get-minimum-transfer-fee (policy-holder principal))
+  (match (map-get? insured-farmers policy-holder)
+    farmer-data (ok (/ (* (get premium-paid farmer-data) TRANSFER-FEE-PERCENTAGE) u100))
+    (err ERR-NOT-INSURED)))
+
+;; Get policy transfer offer details
+(define-read-only (get-policy-transfer-offer (policy-holder principal))
+  (ok (map-get? policy-transfer-offers policy-holder)))
+
+;; Get policy transfer history
+(define-read-only (get-policy-transfer-history (from-farmer principal) (to-farmer principal) (transfer-block uint))
+  (ok (map-get? policy-transfers { from: from-farmer, to: to-farmer, transfer-block: transfer-block })))
+
+;; Check if policy is transferable
+(define-read-only (is-policy-transferable (policy-holder principal))
+  (match (map-get? insured-farmers policy-holder)
+    farmer-data (let (
+      (blocks-since-purchase (- stacks-block-height (get last-payout farmer-data))))
+      (ok {
+        transferable: (and (get active farmer-data) (> blocks-since-purchase MIN-BLOCKS-BEFORE_TRANSFER)),
+        blocks-until-transferable: (if (> MIN-BLOCKS-BEFORE_TRANSFER blocks-since-purchase) 
+          (- MIN-BLOCKS-BEFORE_TRANSFER blocks-since-purchase) u0)
+      }))
+    (ok { transferable: false, blocks-until-transferable: u0 })))
+
 ;; Read-only functions for monitoring and analytics
 (define-read-only (get-regional-emergency-status (region (string-ascii 32)))
   (ok (map-get? regional-weather-emergency region)))
